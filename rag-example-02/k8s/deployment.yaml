@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-app-livedemo
+
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: rag-app-livedemo
+
+  template:
+    metadata:
+      labels:
+        app: rag-app-livedemo
+
+    spec:
+      containers:
+      - name: rag-app-livedemo
+        image: rag-app-livedemo:latest
+        imagePullPolicy: Never
+
+        ports:
+        - containerPort: 8001
