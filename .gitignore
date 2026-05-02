@@ -1,0 +1,35 @@
+# --- API Keys & Secrets ---
+# Crucial: This prevents your keys from leaking to GitHub
+.env
+.flaskenv
+secrets.json
+
+# --- Python Environment ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+build/
+dist/
+
+# --- RAG Specific & Data ---
+# Ignore the PDF files you are testing with
+*.pdf
+# If you use a local Qdrant instance (storage folder)
+storage/
+# If you use Chroma or other local DBs as backup
+*.db
+*.sqlite
+
+# --- IDE & OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Logs & Performance ---
+*.log
+.langsmith/
