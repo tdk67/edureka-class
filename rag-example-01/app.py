@@ -1,8 +1,6 @@
 import os
-import openai
 import gradio as gr
-from langsmith import traceable
-from langsmith.wrappers import wrap_openai
+from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 
 # LangChain Imports
@@ -14,21 +12,50 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 
 # --- Configuration & Environment Variables ---
-# Note: Ensure these are set in your environment or filled in below
-os.environ["OPENAI_API_KEY"] = "YOUR_OPENAI_API_KEY"
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_API_KEY"] = "YOUR_LANGCHAIN_API_KEY"
-os.environ["LANGCHAIN_PROJECT"] = "edurekatest_observability"
-os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
+load_dotenv()
 
-QDRANT_URL = "https://50d072d1-ed73-4cf2-b7d8-df6d633d337f.europe-west3-0.gcp.cloud.qdrant.io"
-QDRANT_API_KEY = "YOUR_QDRANT_API_KEY"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
+COLLECTION_NAME = "my-db-01"
 
-# Initialize LangSmith wrapped client
-client = wrap_openai(openai.Client())
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
-# Global variable for the vector database
+# Global variable for the vector database instance
 VECTOR_DB = None
+
+# --- Connection Factories ---
+
+def get_vector_db():
+    """Safely connects to the existing vector store."""
+    global VECTOR_DB
+    if VECTOR_DB is not None:
+        return VECTOR_DB
+        
+    embeddings = OpenAIEmbeddings()
+    VECTOR_DB = QdrantVectorStore.from_existing_collection(
+        embedding=embeddings,
+        collection_name=COLLECTION_NAME,
+        url=QDRANT_URL,
+        api_key=QDRANT_API_KEY,
+        prefer_grpc=False, 
+        https=True
+    )
+    return VECTOR_DB
+
+def create_vectorstore(chunks):
+    """Ingests new documents into Qdrant Cloud."""
+    embeddings = OpenAIEmbeddings()
+    vectorstore = QdrantVectorStore.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        url=QDRANT_URL,
+        api_key=QDRANT_API_KEY,
+        collection_name=COLLECTION_NAME,
+        prefer_grpc=False, 
+        force_recreate=True 
+    )
+    return vectorstore
 
 # --- Core RAG Functions ---
 
@@ -40,26 +67,8 @@ def load_pdfs(files):
     return documents
 
 def split_documents(documents):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=150,
-    )
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
     return splitter.split_documents(documents)
-
-def create_vectorstore(chunks):
-    embeddings = OpenAIEmbeddings()
-    
-    # Initialize the vector store with Qdrant
-    vectorstore = QdrantVectorStore.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        url=QDRANT_URL,
-        api_key=QDRANT_API_KEY,
-        collection_name="pdf_rag_edureka"
-    )
-    return vectorstore
-
-# --- RAG Chain & Interface Logic ---
 
 RAG_PROMPT = ChatPromptTemplate.from_template("""
 You are a helpful assistant.
@@ -76,17 +85,17 @@ Question:
 Answer very clearly and concisely
 """)
 
+# THIS IS THE MAGIC FIX: Extracts plain text from the retrieved Document objects
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
 def build_rag_chain(vectorstore):
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0
-    )
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    
+    # Notice we pipe the retriever through format_docs before passing it to the prompt
     rag_chain = (
-        {
-            "context": retriever,
-            "question": RunnablePassthrough(),
-        }
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
         | RAG_PROMPT
         | llm
     )
@@ -96,42 +105,52 @@ def ingest_pdf(files):
     global VECTOR_DB
     if not files:
         return "Please upload files."
-
-    documents = load_pdfs(files)
-    chunks = split_documents(documents)
-    VECTOR_DB = create_vectorstore(chunks)
-
-    return f"Successfully ingested {len(chunks)} chunks from {len(files)} PDFs."
+    try:
+        documents = load_pdfs(files)
+        chunks = split_documents(documents)
+        
+        # Upload to Qdrant
+        create_vectorstore(chunks)
+        
+        # Reset the connection so it pulls the fresh data cleanly
+        VECTOR_DB = None 
+        get_vector_db() 
+        
+        return f"✅ Successfully ingested {len(chunks)} chunks into '{COLLECTION_NAME}'."
+    except Exception as e:
+        return f"❌ Ingestion Error: {str(e)}"
 
 def ask_question(question):
-    if VECTOR_DB is None:
-        yield "Upload the files and ingest first."
-        return
-
-    rag_chain = build_rag_chain(VECTOR_DB)
-    response = rag_chain.invoke(question)
-
-    # Streaming effect for Gradio
-    text = response.content
-    partial = ""
-    for char in text:
-        partial += char
-        yield partial
+    try:
+        db = get_vector_db()
+        rag_chain = build_rag_chain(db)
+        
+        response = rag_chain.invoke(question)
+        text = response.content
+        
+        partial = ""
+        for char in text:
+            partial += char
+            yield partial
+    except Exception as e:
+        yield f"❌ Query Error: {str(e)}"
 
 def debug_retrieval(question):
-    global VECTOR_DB
-    if VECTOR_DB is None:
-        return "No DB loaded."
+    try:
+        db = get_vector_db()
+        docs = db.similarity_search(question, k=3)
+        
+        if not docs:
+            return f"No relevant chunks found for: '{question}'"
 
-    docs = VECTOR_DB.similarity_search(question, k=3)
-    output = ""
-    for i, doc in enumerate(docs):
-        output += f"\n--- RESULT {i+1} ---\n"
-        output += f"Source: {doc.metadata.get('source','')}\n"
-        output += f"Page: {doc.metadata.get('page','')}\n"
-        output += f"Chunk ID: {doc.metadata.get('chunk_id','')}\n\n"
-        output += doc.page_content[:1200]
-    return output
+        output = f"DEBUG: Found {len(docs)} chunks.\n"
+        for i, doc in enumerate(docs):
+            output += f"\n--- RESULT {i+1} ---\n"
+            output += f"Source: {doc.metadata.get('source','Unknown')}\n"
+            output += f"{doc.page_content[:600]}...\n"
+        return output
+    except Exception as e:
+        return f"Retrieval Debug Error: {str(e)}"
 
 # --- Gradio UI Setup ---
 
@@ -141,52 +160,26 @@ def main():
         gr.Markdown("Upload PDF Documents and ask questions grounded strictly in their content.")
         
         with gr.Row():
-            pdf_files = gr.File(
-                file_types=[".pdf"],
-                file_count="multiple",
-                label="Upload PDF files"
-            )
+            pdf_files = gr.File(file_types=[".pdf"], file_count="multiple", label="Upload PDF")
         
-        ingest_btn = gr.Button("Ingest PDF")
+        ingest_btn = gr.Button("Step 1: Ingest PDF")
         ingest_status = gr.Textbox(label="Ingestion Status")
-        
-        ingest_btn.click(
-            ingest_pdf,
-            inputs=[pdf_files],
-            outputs=[ingest_status]
-        )
+        ingest_btn.click(ingest_pdf, inputs=[pdf_files], outputs=[ingest_status])
 
         gr.Markdown("---")
 
-        question = gr.Textbox(
-            label="Ask any question",
-            placeholder="What does the document talk about?"
-        )
-
-        ask_btn = gr.Button("Ask")
+        question = gr.Textbox(label="Step 2: Ask any question", placeholder="What does the document talk about?")
+        ask_btn = gr.Button("Ask AI")
         answer_box = gr.Markdown(label="Answer")
-        
-        ask_btn.click(
-            ask_question,
-            inputs=[question],
-            outputs=[answer_box]
-        )
+        ask_btn.click(ask_question, inputs=[question], outputs=[answer_box])
 
         gr.Markdown("---")
 
-        debug_btn = gr.Button("Show retrieved chunks")
-        debug_box = gr.Textbox(
-            label="Retrieved Chunks",
-            lines=20
-        )
+        debug_btn = gr.Button("Debug: Show retrieved chunks")
+        debug_box = gr.Textbox(label="Retrieved Chunks from Qdrant", lines=20)
+        debug_btn.click(debug_retrieval, inputs=[question], outputs=[debug_box])
 
-        debug_btn.click(
-            debug_retrieval,
-            inputs=[question],
-            outputs=[debug_box]
-        )
-
-    demo.launch(debug=False, share=True)
+    demo.launch(debug=False, share=False)
 
 if __name__ == "__main__":
     main()
